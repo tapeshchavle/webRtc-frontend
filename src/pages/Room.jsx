@@ -7,13 +7,13 @@ export default function Room() {
     const { roomId } = useParams();
     const navigate = useNavigate();
     
-    // Video refs
+    // Video refs & states
     const localVideoRef = useRef(null);
-    const remoteVideoRef = useRef(null);
+    const [remoteStreams, setRemoteStreams] = useState({}); // mapping peerId -> mediaStream
     
-    // WebRTC connections
+    // WebRTC connections map: peerId -> RTCPeerConnection
+    const peerConnectionsRef = useRef({});
     const stompClientRef = useRef(null);
-    const peerConnectionRef = useRef(null);
     
     // States
     const [connected, setConnected] = useState(false);
@@ -38,7 +38,7 @@ export default function Room() {
 
         return () => {
             if (stompClientRef.current) stompClientRef.current.deactivate();
-            if (peerConnectionRef.current) peerConnectionRef.current.close();
+            Object.values(peerConnectionsRef.current).forEach(pc => pc.close());
             if (localVideoRef.current && localVideoRef.current.srcObject) {
                 localVideoRef.current.srcObject.getTracks().forEach(track => track.stop());
             }
@@ -70,12 +70,13 @@ export default function Room() {
 
                     if (data.type === 'chat') {
                         setMessages(prev => [...prev, data]);
-                    } else {
+                    } else if (data.target === myId || data.type === 'join' || data.type === 'leave') {
+                        // Only process signaling data if it's meant for us, or a broadcast join/leave
                         handleSignalingData(data);
                     }
                 });
                 
-                // Say hello
+                // Say hello to everyone in the room
                 client.publish({
                     destination: `/app/peer/${roomId}`,
                     body: JSON.stringify({ type: 'join', sender: myId })
@@ -87,49 +88,72 @@ export default function Room() {
         stompClientRef.current = client;
     };
 
-    const getPeerConnection = () => {
-        if (!peerConnectionRef.current) {
-            const pc = new RTCPeerConnection(configuration);
-            peerConnectionRef.current = pc;
+    const createPeerConnection = (peerId) => {
+        if (peerConnectionsRef.current[peerId]) {
+            return peerConnectionsRef.current[peerId];
+        }
 
-            pc.onicecandidate = (event) => {
-                if (event.candidate && stompClientRef.current) {
-                    stompClientRef.current.publish({
-                        destination: `/app/peer/${roomId}`,
-                        body: JSON.stringify({ type: 'candidate', candidate: event.candidate, sender: myId })
-                    });
-                }
-            };
+        const pc = new RTCPeerConnection(configuration);
+        peerConnectionsRef.current[peerId] = pc;
 
-            pc.ontrack = (event) => {
-                if (remoteVideoRef.current) {
-                    remoteVideoRef.current.srcObject = event.streams[0];
-                }
-            };
-
-            const localStream = localVideoRef.current.srcObject;
-            if (localStream) {
-                localStream.getTracks().forEach(track => {
-                    pc.addTrack(track, localStream);
+        pc.onicecandidate = (event) => {
+            if (event.candidate && stompClientRef.current) {
+                stompClientRef.current.publish({
+                    destination: `/app/peer/${roomId}`,
+                    body: JSON.stringify({ type: 'candidate', candidate: event.candidate, sender: myId, target: peerId })
                 });
             }
+        };
+
+        pc.ontrack = (event) => {
+            setRemoteStreams(prev => ({ ...prev, [peerId]: event.streams[0] }));
+        };
+
+        const localStream = localVideoRef.current?.srcObject;
+        if (localStream) {
+            localStream.getTracks().forEach(track => {
+                pc.addTrack(track, localStream);
+            });
         }
-        return peerConnectionRef.current;
+
+        pc.oniceconnectionstatechange = () => {
+            if (pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'closed') {
+                removePeer(peerId);
+            }
+        };
+
+        return pc;
+    };
+
+    const removePeer = (peerId) => {
+        if (peerConnectionsRef.current[peerId]) {
+            peerConnectionsRef.current[peerId].close();
+            delete peerConnectionsRef.current[peerId];
+        }
+        setRemoteStreams(prev => {
+            const newStreams = { ...prev };
+            delete newStreams[peerId];
+            return newStreams;
+        });
     };
 
     const handleSignalingData = async (data) => {
-        if (data.type === 'join') {
-            const pc = getPeerConnection();
+        const { sender, type } = data;
+
+        if (type === 'join') {
+            // Someone joined, let's create a PC and send an offer to them
+            const pc = createPeerConnection(sender);
             const offer = await pc.createOffer();
             await pc.setLocalDescription(offer);
             
             stompClientRef.current.publish({
                 destination: `/app/peer/${roomId}`,
-                body: JSON.stringify({ type: 'offer', offer: pc.localDescription, sender: myId })
+                body: JSON.stringify({ type: 'offer', offer: pc.localDescription, sender: myId, target: sender })
             });
         } 
-        else if (data.type === 'offer') {
-            const pc = getPeerConnection();
+        else if (type === 'offer') {
+            // Someone sent an offer to us
+            const pc = createPeerConnection(sender);
             await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
             
             const answer = await pc.createAnswer();
@@ -137,17 +161,36 @@ export default function Room() {
             
             stompClientRef.current.publish({
                 destination: `/app/peer/${roomId}`,
-                body: JSON.stringify({ type: 'answer', answer: pc.localDescription, sender: myId })
+                body: JSON.stringify({ type: 'answer', answer: pc.localDescription, sender: myId, target: sender })
             });
         } 
-        else if (data.type === 'answer') {
-            const pc = getPeerConnection();
-            await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+        else if (type === 'answer') {
+            // Someone answered our offer
+            const pc = peerConnectionsRef.current[sender];
+            if (pc) {
+                await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+            }
         } 
-        else if (data.type === 'candidate' && data.candidate) {
-            const pc = getPeerConnection();
-            await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+        else if (type === 'candidate' && data.candidate) {
+            // ICE candidate for a specific connection
+            const pc = peerConnectionsRef.current[sender];
+            if (pc) {
+                await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+            }
         }
+        else if (type === 'leave') {
+            removePeer(sender);
+        }
+    };
+
+    const leaveRoom = () => {
+        if (stompClientRef.current) {
+            stompClientRef.current.publish({
+                destination: `/app/peer/${roomId}`,
+                body: JSON.stringify({ type: 'leave', sender: myId })
+            });
+        }
+        navigate('/');
     };
 
     const toggleAudio = () => {
@@ -196,11 +239,27 @@ export default function Room() {
                         <video ref={localVideoRef} autoPlay muted playsInline />
                         <div className="video-badge">You {!isAudioEnabled && '🔇'} </div>
                     </div>
-                    {/* The remote video is permanently in the grid once a track arrives */}
-                    <div className="video-wrapper">
-                        <video ref={remoteVideoRef} autoPlay playsInline />
-                        <div className="video-badge">Remote {!connected && '(Waiting for peer)'}</div>
-                    </div>
+                    {/* Render a video wrapper for every remote peer connected */}
+                    {Object.entries(remoteStreams).map(([peerId, stream]) => (
+                        <div className="video-wrapper" key={peerId}>
+                            <video
+                                autoPlay
+                                playsInline
+                                ref={el => {
+                                    if (el && el.srcObject !== stream) {
+                                        el.srcObject = stream;
+                                    }
+                                }}
+                            />
+                            <div className="video-badge">Peer ({peerId.substring(0,4)})</div>
+                        </div>
+                    ))}
+                    
+                    {Object.keys(remoteStreams).length === 0 && (
+                        <div className="video-wrapper" style={{display: 'flex', alignItems: 'center', justifyContent: 'center', backgroundColor: '#3c4043'}}>
+                            <div style={{color: '#9aa0a6'}}>Waiting for people to join...</div>
+                        </div>
+                    )}
                 </div>
 
                 <div className="bottom-controls">
@@ -216,7 +275,7 @@ export default function Room() {
                         <button className={`ctrl-btn ${!isVideoEnabled ? 'off' : ''}`} onClick={toggleVideo}>
                             {isVideoEnabled ? '📷' : '🚫'}
                         </button>
-                        <button className="ctrl-btn leave-btn" onClick={() => navigate('/')}>
+                        <button className="ctrl-btn leave-btn" onClick={leaveRoom}>
                             ☎️
                         </button>
                     </div>
@@ -242,7 +301,7 @@ export default function Room() {
                         </div>
                         {messages.map((m, i) => (
                             <div key={i} className={`message-bubble ${m.sender === myId ? 'mine' : ''}`}>
-                                <div className="message-sender">{m.sender === myId ? 'You' : 'Peer'}</div>
+                                <div className="message-sender">{m.sender === myId ? 'You' : m.sender.substring(0,4)}</div>
                                 <div>{m.text}</div>
                             </div>
                         ))}
