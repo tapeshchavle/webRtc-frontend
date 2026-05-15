@@ -141,6 +141,7 @@ body {
   grid-template-columns: 1fr 250px;
   grid-auto-rows: min-content;
   align-items: start;
+  row-gap: 0;
 }
 
 .video-wrapper {
@@ -178,6 +179,7 @@ body {
   grid-column: 2;
   width: 100%;
   aspect-ratio: 16/9;
+  margin-bottom: 20px;
 }
 
 .mute-overlay-btn {
