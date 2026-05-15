@@ -19,6 +19,8 @@ export default function Room() {
     const [connected, setConnected] = useState(false);
     const [isAudioEnabled, setIsAudioEnabled] = useState(true);
     const [isVideoEnabled, setIsVideoEnabled] = useState(true);
+    const [pinnedPeer, setPinnedPeer] = useState(null);
+    const [localMutedPeers, setLocalMutedPeers] = useState(new Set());
     
     // Chat states
     const [isChatOpen, setIsChatOpen] = useState(false);
@@ -215,6 +217,20 @@ export default function Room() {
         }
     };
 
+    const togglePin = (id) => {
+        setPinnedPeer(prev => prev === id ? null : id);
+    };
+
+    const toggleLocalMute = (e, id) => {
+        e.stopPropagation();
+        setLocalMutedPeers(prev => {
+            const next = new Set(prev);
+            if (next.has(id)) next.delete(id);
+            else next.add(id);
+            return next;
+        });
+    };
+
     const sendMessage = (e) => {
         e.preventDefault();
         if (!currentMessage.trim() || !stompClientRef.current) return;
@@ -234,17 +250,18 @@ export default function Room() {
     return (
         <div className="room-container">
             <div className="video-area">
-                <div className="video-grid">
-                    <div className="video-wrapper">
+                <div className={`video-grid ${pinnedPeer ? 'pinned-layout' : ''}`}>
+                    <div className={`video-wrapper ${pinnedPeer === 'local' ? 'pinned' : ''}`} onClick={() => togglePin('local')}>
                         <video ref={localVideoRef} autoPlay muted playsInline />
                         <div className="video-badge">You {!isAudioEnabled && '🔇'} </div>
                     </div>
                     {/* Render a video wrapper for every remote peer connected */}
                     {Object.entries(remoteStreams).map(([peerId, stream]) => (
-                        <div className="video-wrapper" key={peerId}>
+                        <div className={`video-wrapper ${pinnedPeer === peerId ? 'pinned' : ''}`} key={peerId} onClick={() => togglePin(peerId)}>
                             <video
                                 autoPlay
                                 playsInline
+                                muted={localMutedPeers.has(peerId)}
                                 ref={el => {
                                     if (el && el.srcObject !== stream) {
                                         el.srcObject = stream;
@@ -252,10 +269,13 @@ export default function Room() {
                                 }}
                             />
                             <div className="video-badge">Peer ({peerId.substring(0,4)})</div>
+                            <button className="mute-overlay-btn" onClick={(e) => toggleLocalMute(e, peerId)}>
+                                {localMutedPeers.has(peerId) ? '🔇' : '🔊'}
+                            </button>
                         </div>
                     ))}
                     
-                    {Object.keys(remoteStreams).length === 0 && (
+                    {Object.keys(remoteStreams).length === 0 && !pinnedPeer && (
                         <div className="video-wrapper" style={{display: 'flex', alignItems: 'center', justifyContent: 'center', backgroundColor: '#3c4043'}}>
                             <div style={{color: '#9aa0a6'}}>Waiting for people to join...</div>
                         </div>
