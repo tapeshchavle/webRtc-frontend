@@ -9,6 +9,8 @@ export default function Room() {
     
     // Video refs & states
     const localVideoRef = useRef(null);
+    const localStreamRef = useRef(null);
+    const screenStreamRef = useRef(null);
     const [remoteStreams, setRemoteStreams] = useState({}); // mapping peerId -> mediaStream
     
     // WebRTC connections map: peerId -> RTCPeerConnection
@@ -19,6 +21,7 @@ export default function Room() {
     const [connected, setConnected] = useState(false);
     const [isAudioEnabled, setIsAudioEnabled] = useState(true);
     const [isVideoEnabled, setIsVideoEnabled] = useState(true);
+    const [isScreenSharing, setIsScreenSharing] = useState(false);
     const [pinnedPeer, setPinnedPeer] = useState(null);
     const [localMutedPeers, setLocalMutedPeers] = useState(new Set());
     
@@ -53,6 +56,7 @@ export default function Room() {
             if (localVideoRef.current) {
                  localVideoRef.current.srcObject = stream;
             }
+            localStreamRef.current = stream;
         } catch(e) {
             console.error('Error accessing media', e);
             alert("Could not access camera or microphone!");
@@ -111,10 +115,17 @@ export default function Room() {
             setRemoteStreams(prev => ({ ...prev, [peerId]: event.streams[0] }));
         };
 
-        const localStream = localVideoRef.current?.srcObject;
-        if (localStream) {
-            localStream.getTracks().forEach(track => {
-                pc.addTrack(track, localStream);
+        const cameraStream = localStreamRef.current;
+        if (cameraStream) {
+            cameraStream.getTracks().forEach(track => {
+                if (track.kind === 'video' && isScreenSharing && screenStreamRef.current) {
+                    const screenTrack = screenStreamRef.current.getVideoTracks()[0];
+                    if (screenTrack) {
+                        pc.addTrack(screenTrack, cameraStream);
+                        return;
+                    }
+                }
+                pc.addTrack(track, cameraStream);
             });
         }
 
@@ -195,8 +206,63 @@ export default function Room() {
         navigate('/');
     };
 
+    const toggleScreenShare = async () => {
+        if (!isScreenSharing) {
+            try {
+                const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+                const screenTrack = screenStream.getVideoTracks()[0];
+
+                screenTrack.onended = () => {
+                    stopScreenShare();
+                };
+
+                Object.values(peerConnectionsRef.current).forEach(pc => {
+                    const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+                    if (sender) {
+                        sender.replaceTrack(screenTrack);
+                    }
+                });
+
+                if (localVideoRef.current) {
+                    localVideoRef.current.srcObject = screenStream;
+                }
+
+                screenStreamRef.current = screenStream;
+                setIsScreenSharing(true);
+            } catch (e) {
+                console.error('Failed to share screen', e);
+            }
+        } else {
+            stopScreenShare();
+        }
+    };
+
+    const stopScreenShare = () => {
+        if (screenStreamRef.current) {
+            screenStreamRef.current.getTracks().forEach(t => t.stop());
+            screenStreamRef.current = null;
+        }
+
+        const cameraStream = localStreamRef.current;
+        const cameraTrack = cameraStream?.getVideoTracks()[0];
+
+        if (cameraTrack) {
+            Object.values(peerConnectionsRef.current).forEach(pc => {
+                const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+                if (sender) {
+                    sender.replaceTrack(cameraTrack);
+                }
+            });
+
+            if (localVideoRef.current) {
+                localVideoRef.current.srcObject = cameraStream;
+            }
+        }
+        setIsScreenSharing(false);
+    };
+
     const toggleAudio = () => {
-        const stream = localVideoRef.current?.srcObject;
+        const stream = localStreamRef.current;
         if (stream) {
             const audioTrack = stream.getAudioTracks()[0];
             if (audioTrack) {
@@ -207,7 +273,7 @@ export default function Room() {
     };
 
     const toggleVideo = () => {
-        const stream = localVideoRef.current?.srcObject;
+        const stream = localStreamRef.current;
         if (stream) {
             const videoTrack = stream.getVideoTracks()[0];
             if (videoTrack) {
@@ -294,6 +360,9 @@ export default function Room() {
                         </button>
                         <button className={`ctrl-btn ${!isVideoEnabled ? 'off' : ''}`} onClick={toggleVideo}>
                             {isVideoEnabled ? '📷' : '🚫'}
+                        </button>
+                        <button className={`ctrl-btn ${isScreenSharing ? 'off' : ''}`} onClick={toggleScreenShare}>
+                            {isScreenSharing ? '🖥️' : '💻'}
                         </button>
                         <button className="ctrl-btn leave-btn" onClick={leaveRoom}>
                             ☎️
