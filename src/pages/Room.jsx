@@ -72,11 +72,12 @@ export default function Room() {
                 
                 client.subscribe(`/topic/room/${roomId}`, (msg) => {
                     const data = JSON.parse(msg.body);
-                    if (data.sender === myId) return; 
+                    const screenId = myId + '_scr';
+                    if (data.sender === myId || data.sender === screenId) return; 
 
                     if (data.type === 'chat') {
                         setMessages(prev => [...prev, data]);
-                    } else if (data.target === myId || data.type === 'join' || data.type === 'leave') {
+                    } else if (data.target === myId || data.target === screenId || data.type === 'join' || data.type === 'leave') {
                         // Only process signaling data if it's meant for us, or a broadcast join/leave
                         handleSignalingData(data);
                     }
@@ -94,44 +95,51 @@ export default function Room() {
         stompClientRef.current = client;
     };
 
-    const createPeerConnection = (peerId) => {
-        if (peerConnectionsRef.current[peerId]) {
-            return peerConnectionsRef.current[peerId];
+    const createPeerConnection = (pcKey, isForMyScreen = false, senderId = null, remoteTargetId = null) => {
+        if (!senderId) senderId = myId;
+        if (!remoteTargetId) remoteTargetId = pcKey;
+
+        if (peerConnectionsRef.current[pcKey]) {
+            return peerConnectionsRef.current[pcKey];
         }
 
         const pc = new RTCPeerConnection(configuration);
-        peerConnectionsRef.current[peerId] = pc;
+        peerConnectionsRef.current[pcKey] = pc;
 
         pc.onicecandidate = (event) => {
             if (event.candidate && stompClientRef.current) {
                 stompClientRef.current.publish({
                     destination: `/app/peer/${roomId}`,
-                    body: JSON.stringify({ type: 'candidate', candidate: event.candidate, sender: myId, target: peerId })
+                    body: JSON.stringify({ type: 'candidate', candidate: event.candidate, sender: senderId, target: remoteTargetId })
                 });
             }
         };
 
         pc.ontrack = (event) => {
-            setRemoteStreams(prev => ({ ...prev, [peerId]: event.streams[0] }));
+            setRemoteStreams(prev => ({ ...prev, [pcKey]: event.streams[0] }));
         };
 
-        const cameraStream = localStreamRef.current;
-        if (cameraStream) {
-            cameraStream.getTracks().forEach(track => {
-                if (track.kind === 'video' && isScreenSharing && screenStreamRef.current) {
-                    const screenTrack = screenStreamRef.current.getVideoTracks()[0];
-                    if (screenTrack) {
-                        pc.addTrack(screenTrack, cameraStream);
-                        return;
-                    }
+        if (isForMyScreen) {
+            if (screenStreamRef.current) {
+                screenStreamRef.current.getTracks().forEach(track => {
+                    pc.addTrack(track, screenStreamRef.current);
+                });
+            }
+        } else {
+            const isRemoteScreen = remoteTargetId && remoteTargetId.endsWith('_scr');
+            if (!isRemoteScreen) {
+                const cameraStream = localStreamRef.current;
+                if (cameraStream) {
+                    cameraStream.getTracks().forEach(track => {
+                        pc.addTrack(track, cameraStream);
+                    });
                 }
-                pc.addTrack(track, cameraStream);
-            });
+            }
         }
 
         pc.oniceconnectionstatechange = () => {
             if (pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'closed') {
-                removePeer(peerId);
+                removePeer(pcKey);
             }
         };
 
@@ -151,11 +159,12 @@ export default function Room() {
     };
 
     const handleSignalingData = async (data) => {
-        const { sender, type } = data;
+        const { sender, type, target } = data;
+        const screenId = myId + '_scr';
 
         if (type === 'join') {
             // Someone joined, let's create a PC and send an offer to them
-            const pc = createPeerConnection(sender);
+            const pc = createPeerConnection(sender, false, myId, sender);
             const offer = await pc.createOffer();
             await pc.setLocalDescription(offer);
             
@@ -163,10 +172,22 @@ export default function Room() {
                 destination: `/app/peer/${roomId}`,
                 body: JSON.stringify({ type: 'offer', offer: pc.localDescription, sender: myId, target: sender })
             });
+
+            if (isScreenSharing && screenStreamRef.current) {
+                const pc2 = createPeerConnection('screen_out_' + sender, true, screenId, sender);
+                const offer2 = await pc2.createOffer();
+                await pc2.setLocalDescription(offer2);
+                stompClientRef.current.publish({
+                    destination: `/app/peer/${roomId}`,
+                    body: JSON.stringify({ type: 'offer', offer: pc2.localDescription, sender: screenId, target: sender })
+                });
+            }
         } 
         else if (type === 'offer') {
             // Someone sent an offer to us
-            const pc = createPeerConnection(sender);
+            const isForMyScreen = target === screenId;
+            const pcKey = isForMyScreen ? sender + '_for_my_screen' : sender;
+            const pc = createPeerConnection(pcKey, isForMyScreen, target || myId, sender);
             await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
             
             const answer = await pc.createAnswer();
@@ -174,25 +195,35 @@ export default function Room() {
             
             stompClientRef.current.publish({
                 destination: `/app/peer/${roomId}`,
-                body: JSON.stringify({ type: 'answer', answer: pc.localDescription, sender: myId, target: sender })
+                body: JSON.stringify({ type: 'answer', answer: pc.localDescription, sender: target || myId, target: sender })
             });
         } 
         else if (type === 'answer') {
             // Someone answered our offer
-            const pc = peerConnectionsRef.current[sender];
+            const isForMyScreen = target === screenId;
+            const pcKey = isForMyScreen ? 'screen_out_' + sender : sender;
+            const pc = peerConnectionsRef.current[pcKey];
             if (pc) {
                 await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
             }
         } 
         else if (type === 'candidate' && data.candidate) {
             // ICE candidate for a specific connection
-            const pc = peerConnectionsRef.current[sender];
+            const isForMyScreen = target === screenId;
+            let pcKey = sender;
+            if (isForMyScreen) {
+                 if (peerConnectionsRef.current['screen_out_' + sender]) pcKey = 'screen_out_' + sender;
+                 else pcKey = sender + '_for_my_screen';
+            }
+            const pc = peerConnectionsRef.current[pcKey];
             if (pc) {
                 await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
             }
         }
         else if (type === 'leave') {
             removePeer(sender);
+            removePeer('screen_out_' + sender);
+            removePeer(sender + '_for_my_screen');
         }
     };
 
@@ -211,24 +242,24 @@ export default function Room() {
             try {
                 const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
                 const screenTrack = screenStream.getVideoTracks()[0];
+                const screenId = myId + '_scr';
 
                 screenTrack.onended = () => {
                     stopScreenShare();
                 };
 
-                Object.values(peerConnectionsRef.current).forEach(pc => {
-                    const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
-                    if (sender) {
-                        sender.replaceTrack(screenTrack);
-                    }
-                });
-
-                if (localVideoRef.current) {
-                    localVideoRef.current.srcObject = screenStream;
-                }
-
+                // Add stream to local state so we can render it without replacing local webcam
+                setRemoteStreams(prev => ({ ...prev, [screenId]: screenStream }));
+                
                 screenStreamRef.current = screenStream;
                 setIsScreenSharing(true);
+
+                if (stompClientRef.current) {
+                    stompClientRef.current.publish({
+                        destination: `/app/peer/${roomId}`,
+                        body: JSON.stringify({ type: 'join', sender: screenId })
+                    });
+                }
             } catch (e) {
                 console.error('Failed to share screen', e);
             }
@@ -242,23 +273,21 @@ export default function Room() {
             screenStreamRef.current.getTracks().forEach(t => t.stop());
             screenStreamRef.current = null;
         }
+        
+        const screenId = myId + '_scr';
+        setRemoteStreams(prev => {
+            const newStreams = { ...prev };
+            delete newStreams[screenId];
+            return newStreams;
+        });
 
-        const cameraStream = localStreamRef.current;
-        const cameraTrack = cameraStream?.getVideoTracks()[0];
-
-        if (cameraTrack) {
-            Object.values(peerConnectionsRef.current).forEach(pc => {
-                const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
-                if (sender) {
-                    sender.replaceTrack(cameraTrack);
-                }
-            });
-
-            if (localVideoRef.current) {
-                localVideoRef.current.srcObject = cameraStream;
-            }
-        }
         setIsScreenSharing(false);
+        if (stompClientRef.current) {
+            stompClientRef.current.publish({
+                destination: `/app/peer/${roomId}`,
+                body: JSON.stringify({ type: 'leave', sender: screenId })
+            });
+        }
     };
 
     const toggleAudio = () => {
@@ -323,18 +352,20 @@ export default function Room() {
                     </div>
                     {/* Render a video wrapper for every remote peer connected */}
                     {Object.entries(remoteStreams).map(([peerId, stream]) => (
-                        <div className={`video-wrapper ${pinnedPeer === peerId ? 'pinned' : ''}`} key={peerId} onClick={() => togglePin(peerId)}>
+                        <div className={`video-wrapper ${pinnedPeer === peerId ? 'pinned' : ''} ${peerId.endsWith('_scr') ? 'screen-share' : ''}`} key={peerId} onClick={() => togglePin(peerId)}>
                             <video
                                 autoPlay
                                 playsInline
-                                muted={localMutedPeers.has(peerId)}
+                                muted={localMutedPeers.has(peerId) || peerId === myId + '_scr'}
                                 ref={el => {
                                     if (el && el.srcObject !== stream) {
                                         el.srcObject = stream;
                                     }
                                 }}
                             />
-                            <div className="video-badge">Peer ({peerId.substring(0,4)})</div>
+                            <div className="video-badge">
+                                {peerId === myId + '_scr' ? 'Your Screen' : peerId.endsWith('_scr') ? `Peer Screen (${peerId.substring(0,4)})` : `Peer (${peerId.substring(0,4)})`}
+                            </div>
                             <button className="mute-overlay-btn" onClick={(e) => toggleLocalMute(e, peerId)}>
                                 {localMutedPeers.has(peerId) ? '🔇' : '🔊'}
                             </button>
