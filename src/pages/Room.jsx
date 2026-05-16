@@ -134,6 +134,12 @@ export default function Room() {
                         pc.addTrack(track, cameraStream);
                     });
                 }
+            } else {
+                // When connecting to a remote screen share, add recvonly transceivers
+                // so the SDP offer includes video/audio media lines for the sharer to send into.
+                // Without this, the offer has NO media sections and the sharer can't answer with video.
+                pc.addTransceiver('video', { direction: 'recvonly' });
+                pc.addTransceiver('audio', { direction: 'recvonly' });
             }
         }
 
